@@ -4,11 +4,15 @@ import json
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from imblearn.over_sampling import SMOTE
+from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 
 from src.modeling.metrics import CalibrationResult, best_f1_threshold, calibrate_platt, evaluate_binary_classifier
+from src.modeling.shap_artifacts import save_shap_artifacts
+from src.modeling.threshold_bands import compute_threshold_bands, save_threshold_bands
 from src.modeling.xgb_runtime import resolve_xgb_compute
 from src.preprocessing.baf_preprocessor import BAFPreprocessor, TimeSplit
 from src.retriever.enrichment import build_retriever_features_for_records
@@ -79,6 +83,7 @@ def train_enriched(
     valid_scores = model.predict_proba(X_valid_enriched)[:, 1]
     test_scores = model.predict_proba(X_test_enriched)[:, 1]
     calibrator: CalibrationResult = calibrate_platt(y_valid.to_numpy(), valid_scores)
+    valid_scores_cal = calibrator.model.predict_proba(valid_scores.reshape(-1, 1))[:, 1]
     test_scores_cal = calibrator.model.predict_proba(test_scores.reshape(-1, 1))[:, 1]
     threshold = best_f1_threshold(y_valid.to_numpy(), valid_scores)
     fairness_groups = None
@@ -95,6 +100,108 @@ def train_enriched(
 
     joblib.dump(model, output / "model.pkl")
     joblib.dump(calibrator.model, output / "platt_calibrator.pkl")
+
+    def _logit(p: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        p = np.clip(p, eps, 1.0 - eps)
+        return np.log(p / (1.0 - p))
+
+    calibrator_feature_cols = ["logit_p_model_calibrated"] + retr_valid.columns.tolist()
+    X_cal_valid = pd.concat(
+        [
+            pd.Series(_logit(valid_scores_cal), index=valid_df.index, name="logit_p_model_calibrated"),
+            retr_valid,
+        ],
+        axis=1,
+    )
+    risk_calibrator = LogisticRegression(max_iter=2000, solver="lbfgs")
+    risk_calibrator.fit(X_cal_valid.to_numpy(), y_valid.to_numpy())
+    joblib.dump(risk_calibrator, output / "risk_calibrator.pkl")
+    (output / "risk_calibrator_metadata.json").write_text(
+        json.dumps(
+            {
+                "type": "logistic_regression",
+                "feature_cols": calibrator_feature_cols,
+                "p_base_col": "p_model_calibrated",
+                "logit_base_col": "logit_p_model_calibrated",
+            },
+            indent=2,
+        )
+    )
+
+    X_cal_test = pd.concat(
+        [
+            pd.Series(_logit(test_scores_cal), index=test_df.index, name="logit_p_model_calibrated"),
+            retr_test,
+        ],
+        axis=1,
+    )
+    p_final_valid = risk_calibrator.predict_proba(X_cal_valid.to_numpy())[:, 1]
+    p_final_test = risk_calibrator.predict_proba(X_cal_test.to_numpy())[:, 1]
+
+    save_shap_artifacts(
+        model=model,
+        X=X_valid_enriched,
+        record_index=valid_df.index.to_numpy(),
+        output_dir=output,
+        prefix="shap_month6",
+        top_k=10,
+    )
+    save_shap_artifacts(
+        model=model,
+        X=X_test_enriched,
+        record_index=test_df.index.to_numpy(),
+        output_dir=output,
+        prefix="shap_month7",
+        top_k=10,
+    )
+
+    bands = compute_threshold_bands(
+        y_valid=y_valid.to_numpy(),
+        p_valid=p_final_valid,
+        y_test=y_test.to_numpy(),
+        p_test=p_final_test,
+        target_precision_high=0.80,
+        target_precision_med=0.60,
+    )
+    save_threshold_bands(bands, output_dir=output, filename="threshold_bands.json")
+
+    def _pick_id_column(frame: pd.DataFrame) -> str | None:
+        for candidate in ("account_id", "application_id", "id"):
+            if candidate in frame.columns:
+                return candidate
+        return None
+
+    id_col = _pick_id_column(df)
+    valid_pred = pd.DataFrame(
+        {
+            "record_index": valid_df.index.to_numpy(),
+            "month": valid_df[month_col].to_numpy() if month_col in valid_df.columns else 6,
+            "label": y_valid.to_numpy(),
+            "p_model": valid_scores,
+            "p_model_calibrated": valid_scores_cal,
+            "p_final": p_final_valid,
+        },
+        index=valid_df.index,
+    )
+    test_pred = pd.DataFrame(
+        {
+            "record_index": test_df.index.to_numpy(),
+            "month": test_df[month_col].to_numpy() if month_col in test_df.columns else 7,
+            "label": y_test.to_numpy(),
+            "p_model": test_scores,
+            "p_model_calibrated": test_scores_cal,
+            "p_final": p_final_test,
+        },
+        index=test_df.index,
+    )
+    if id_col is not None:
+        valid_pred[id_col] = valid_df[id_col].to_numpy()
+        test_pred[id_col] = test_df[id_col].to_numpy()
+    valid_pred = pd.concat([valid_pred, retr_valid], axis=1)
+    test_pred = pd.concat([test_pred, retr_test], axis=1)
+    valid_pred.to_csv(output / "predictions_month6.csv", index=False)
+    test_pred.to_csv(output / "predictions_month7.csv", index=False)
+
     pd.DataFrame({"score": test_scores, "label": y_test.to_numpy()}).to_csv(output / "test_predictions.csv", index=False)
     pd.DataFrame({"score_calibrated": test_scores_cal, "label": y_test.to_numpy()}).to_csv(output / "test_predictions_calibrated.csv", index=False)
     calibration_report = {

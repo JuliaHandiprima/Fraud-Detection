@@ -136,6 +136,8 @@ def main() -> None:
                 "artifact_template": "results/variants/{variant}/{champion}/model.pkl",
                 "calibrator_template": "results/variants/{variant}/{champion}/platt_calibrator.pkl",
                 "preprocessor_template": "results/variants/{variant}/{champion}/baf_preprocessor.pkl",
+                "risk_calibrator_template": "results/variants/{variant}/{champion}/risk_calibrator.pkl",
+                "threshold_bands_template": "results/variants/{variant}/{champion}/threshold_bands.json",
             },
             indent=2,
         )

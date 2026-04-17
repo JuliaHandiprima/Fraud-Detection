@@ -14,7 +14,7 @@ import xgboost as xgb
 from openai import OpenAI
 
 from src.preprocessing.baf_preprocessor import BAFPreprocessor
-from src.retriever.enrichment import build_retriever_features_for_records
+from src.retriever.enrichment import build_retriever_features_for_records, retrieve_retriever_evidence
 
 
 @dataclass(frozen=True)
@@ -72,12 +72,28 @@ class AccountFraudInferenceService:
         model_path: str | Path,
         preprocessor_path: str | Path,
         calibrator_path: str | Path | None = None,
+        risk_calibrator_path: str | Path | None = None,
+        threshold_bands_path: str | Path | None = None,
         enriched: bool = True,
         policy: DecisionPolicy | None = None,
     ) -> None:
-        self.model = joblib.load(model_path)
+        self.model_path = Path(model_path)
+        self.model = joblib.load(self.model_path)
         self.preprocessor: BAFPreprocessor = BAFPreprocessor.load(preprocessor_path)
         self.calibrator = joblib.load(calibrator_path) if calibrator_path else None
+        if risk_calibrator_path is None:
+            candidate = self.model_path.parent / "risk_calibrator.pkl"
+            risk_calibrator_path = candidate if candidate.exists() else None
+        self.risk_calibrator = joblib.load(risk_calibrator_path) if risk_calibrator_path else None
+        self.risk_calibrator_meta = None
+        meta_path = self.model_path.parent / "risk_calibrator_metadata.json"
+        if meta_path.exists():
+            self.risk_calibrator_meta = json.loads(meta_path.read_text())
+
+        if threshold_bands_path is None:
+            candidate = self.model_path.parent / "threshold_bands.json"
+            threshold_bands_path = candidate if candidate.exists() else None
+        self.threshold_bands = json.loads(Path(threshold_bands_path).read_text()) if threshold_bands_path else None
         self.enriched = enriched
         self.policy = policy or DecisionPolicy()
         try:
@@ -88,23 +104,62 @@ class AccountFraudInferenceService:
     def score(self, record: dict[str, Any]) -> dict[str, Any]:
         raw_df = pd.DataFrame([record])
         X = self.preprocessor.transform_records(raw_df)
-        retriever_features = {}
+        retr = build_retriever_features_for_records(raw_df)
+        retriever_features = retr.iloc[0].to_dict()
+        retriever_evidence = retrieve_retriever_evidence(record, top_k=5)
         if self.enriched:
-            retr = build_retriever_features_for_records(raw_df)
-            retriever_features = retr.iloc[0].to_dict()
             X = pd.concat([X, retr], axis=1)
 
-        score = float(self.model.predict_proba(X)[:, 1][0])
+        p_model = float(self.model.predict_proba(X)[:, 1][0])
+        p_model_cal = p_model
         if self.calibrator is not None:
-            score = float(self.calibrator.predict_proba(np.array([[score]], dtype=float))[:, 1][0])
-        action = recommend_action(score, self.policy)
+            p_model_cal = float(self.calibrator.predict_proba(np.array([[p_model]], dtype=float))[:, 1][0])
+
+        p_final = p_model_cal
+        if self.risk_calibrator is not None and retriever_features:
+            eps = 1e-6
+            p_clip = float(min(max(p_model_cal, eps), 1.0 - eps))
+            logit_p = float(np.log(p_clip / (1.0 - p_clip)))
+            feature_cols = None
+            if isinstance(self.risk_calibrator_meta, dict):
+                feature_cols = self.risk_calibrator_meta.get("feature_cols")
+            if isinstance(feature_cols, list) and feature_cols:
+                row = {}
+                row["logit_p_model_calibrated"] = logit_p
+                row.update({k: float(v) for k, v in retriever_features.items()})
+                x_vec = np.array([[row.get(col, 0.0) for col in feature_cols]], dtype=float)
+            else:
+                x_vec = np.array([[logit_p] + [float(v) for v in retriever_features.values()]], dtype=float)
+            p_final = float(self.risk_calibrator.predict_proba(x_vec)[:, 1][0])
+
+        t_med = None
+        t_high = None
+        if isinstance(self.threshold_bands, dict):
+            selected = self.threshold_bands.get("selected", {})
+            t_med = selected.get("t_med")
+            t_high = selected.get("t_high")
+        confidence_band = "unknown"
+        if isinstance(t_med, (float, int)) and isinstance(t_high, (float, int)):
+            confidence_band = "high" if p_final >= float(t_high) else ("medium" if p_final >= float(t_med) else "low")
+        elif isinstance(t_med, (float, int)):
+            confidence_band = "medium" if p_final >= float(t_med) else "low"
+
+        predicted_label = int(p_final >= float(t_med)) if isinstance(t_med, (float, int)) else int(p_final >= 0.5)
+
+        action = recommend_action(p_final, self.policy)
         top_drivers = _top_shap_features(self.explainer, self.model, X, top_n=5)
         grounded = {
-            "fraud_score": score,
+            "p_model": p_model,
+            "p_model_calibrated": p_model_cal,
+            "p_final": p_final,
+            "predicted_label": predicted_label,
+            "confidence_band": confidence_band,
+            "thresholds": {"t_med": t_med, "t_high": t_high},
             "decision_policy": asdict(self.policy),
             "recommended_action": action,
             "top_shap_drivers": top_drivers,
-            "retriever_evidence": retriever_features,
+            "retriever_features": retriever_features,
+            "retriever_cases": retriever_evidence.get("top_cases") if isinstance(retriever_evidence, dict) else [],
         }
         report_text = _generate_llm_report(grounded)
         return {
@@ -125,10 +180,20 @@ class AccountFraudInferenceService:
         model_path = payload["artifact_template"].format(variant=variant_name, champion=champion)
         calibrator_path = payload["calibrator_template"].format(variant=variant_name, champion=champion)
         preprocessor_path = payload["preprocessor_template"].format(variant=variant_name, champion=champion)
+        risk_calibrator_template = payload.get("risk_calibrator_template")
+        threshold_bands_template = payload.get("threshold_bands_template")
+        risk_calibrator_path = (
+            risk_calibrator_template.format(variant=variant_name, champion=champion) if isinstance(risk_calibrator_template, str) else None
+        )
+        threshold_bands_path = (
+            threshold_bands_template.format(variant=variant_name, champion=champion) if isinstance(threshold_bands_template, str) else None
+        )
         return cls(
             model_path=model_path,
             preprocessor_path=preprocessor_path,
             calibrator_path=calibrator_path,
+            risk_calibrator_path=risk_calibrator_path,
+            threshold_bands_path=threshold_bands_path,
             enriched=enriched,
             policy=policy,
         )
