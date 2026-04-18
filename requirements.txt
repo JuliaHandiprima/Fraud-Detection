@@ -1,0 +1,12 @@
+flask
+joblib
+numpy
+openai
+pandas
+psycopg2-binary
+pyyaml
+scikit-learn
+imbalanced-learn
+shap
+xgboost
+streamlit

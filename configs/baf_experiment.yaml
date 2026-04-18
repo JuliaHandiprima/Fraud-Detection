@@ -1,0 +1,44 @@
+data:
+  target_col: fraud_bool
+  month_col: month
+  train_months: [0, 1, 2, 3, 4, 5]
+  valid_months: [6]
+  test_months: [7]
+  variants:
+    - name: variant_1
+      path: data/variant_1.csv
+    - name: variant_2
+      path: data/variant_2.csv
+    - name: variant_3
+      path: data/variant_3.csv
+    - name: variant_4
+      path: data/variant_4.csv
+    - name: variant_5
+      path: data/variant_5.csv
+    - name: variant_6
+      path: data/variant_6.csv
+
+preprocessing:
+  use_yeo_johnson: true
+  treat_minus_one_as_missing: true
+
+model:
+  family: xgboost
+  objective: binary:logistic
+  eval_metric: aucpr
+  tree_method: hist
+  device_preference: cuda
+  calibration: platt_sigmoid
+
+imbalance:
+  method: smote
+  sampling_strategy: 0.5
+  random_state: 42
+
+retriever:
+  top_k: 20
+  temporal_rule: neighbor_month < query_month
+
+policy:
+  approve_threshold: 0.30
+  escalate_threshold: 0.65

@@ -1,0 +1,8 @@
+[
+  {"name": "variant_base", "path": "data/Base.csv"},
+  {"name": "variant_i", "path": "data/Variant I.csv"},
+  {"name": "variant_ii", "path": "data/Variant II.csv"},
+  {"name": "variant_iii", "path": "data/Variant III.csv"},
+  {"name": "variant_iv", "path": "data/Variant IV.csv"},
+  {"name": "variant_v", "path": "data/Variant V.csv"}
+]
