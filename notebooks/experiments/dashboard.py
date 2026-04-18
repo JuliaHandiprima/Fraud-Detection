@@ -126,7 +126,7 @@ def display_analysis_summary(ret_data):
         model_line = "**Champion model:** not loaded — start retriever with `CHAMPION_MANIFEST_PATH` for p_final."
 
     st.info(f"{retr_line}\n\n{model_line}")
-    
+
     # Build table of similar cases (top 20)
     all_features = ['income', 'velocity_6h', 'payment_type', 'prev_address_months_count', 
                     'intended_balcon_amount', 'name_email_similarity', 'zip_count_4w']
